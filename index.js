@@ -9,6 +9,12 @@ const WEBHOOK_SECRET = process.env.DROPP_WEBHOOK_SECRET;
 const SALES_CHANNEL_ID = '1475643785307492557';
 
 const discordClient = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+let discordReady = false;
+discordClient.once('ready', () => {
+  console.log('✅ Discord bot prêt');
+  discordReady = true;
+});
 discordClient.login(process.env.DISCORD_BOT_TOKEN);
 
 app.use(express.raw({ type: 'application/json' }));
@@ -32,6 +38,11 @@ async function getOrderDetails(orderId) {
   return await res.json();
 }
 
+async function waitForDiscord() {
+  if (discordReady) return;
+  await new Promise(resolve => discordClient.once('ready', resolve));
+}
+
 app.post('/webhook', async (req, res) => {
   const rawBody = req.body;
 
@@ -43,6 +54,8 @@ app.post('/webhook', async (req, res) => {
   console.log(`📩 Event reçu: ${payload.event}`);
 
   if (payload.event === 'order.paid') {
+    await waitForDiscord();
+
     const orderId = payload.data.id;
     const montantCents = payload.data.amount.total_cents;
     const montant = (montantCents / 100).toFixed(2);
@@ -60,35 +73,14 @@ app.post('/webhook', async (req, res) => {
       '1': 'Daniel', '2': 'Hélène', '3': 'Rozen', '4': 'Temad', '5': 'Canal'
     };
 
-    const rows = [];
     const keys = Object.keys(CHATTERS);
-    for (let i = 0; i < keys.length; i += 4) {
-      const row = new ActionRowBuilder();
-      keys.slice(i, i + 4).forEach(key => {
-        row.addComponents(
-          new ButtonBuilder()
-            .setCustomId(`claim_${key}_PLACEHOLDER`)
-            .setLabel(CHATTERS[key])
-            .setStyle(ButtonStyle.Primary)
-        );
-      });
-      rows.push(row);
-    }
 
-    const linkRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`link_telegram_PLACEHOLDER`)
-        .setLabel('🔗 Lier le Telegram')
-        .setStyle(ButtonStyle.Secondary)
-    );
-    rows.push(linkRow);
-
+    // Envoie d'abord le message sans boutons
     const msg = await channel.send({
-      content: `@everyone **New payment received** 🤑\n**Montant :** ${montant} EUR\n**Client :** ${clientName}\n**Email :** ${email}\n**Produit :** ${linkName}`,
-      components: rows
+      content: `@everyone **New payment received** 🤑\n**Montant :** ${montant} EUR\n**Client :** ${clientName}\n**Email :** ${email}\n**Produit :** ${linkName}`
     });
 
-    // Met à jour les boutons avec le vrai message ID
+    // Construit les boutons avec le vrai message ID
     const realRows = [];
     for (let i = 0; i < keys.length; i += 4) {
       const row = new ActionRowBuilder();
@@ -112,6 +104,7 @@ app.post('/webhook', async (req, res) => {
     realRows.push(realLinkRow);
 
     await msg.edit({ components: realRows });
+    console.log('✅ Message envoyé avec boutons');
   }
 
   res.status(200).send('OK');
