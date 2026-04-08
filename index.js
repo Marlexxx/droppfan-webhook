@@ -47,7 +47,7 @@ app.post('/webhook', async (req, res) => {
   const payload = JSON.parse(rawBody);
   console.log(`📩 Event reçu: ${payload.event}`);
 
- if (payload.event === 'order.paid' && !payload.test) {
+ if (payload.event === 'order.paid'  {
     const orderId = payload.data.id;
     const montantCents = payload.data.amount.total_cents;
     const montant = (montantCents / 100).toFixed(2);
