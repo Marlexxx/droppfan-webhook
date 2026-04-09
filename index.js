@@ -84,7 +84,7 @@ app.post('/webhook', async (req, res) => {
   const payload = JSON.parse(rawBody);
   console.log(`📩 Event reçu: ${payload.event}`);
 
-  if (payload.event === 'order.paid' && !payload.test) {
+  if (payload.event === 'order.paid') {
     await waitForDiscord();
 
     const orderId = payload.data.id;
