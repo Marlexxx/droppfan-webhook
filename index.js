@@ -1,78 +1,159 @@
 const express = require('express');
-const crypto = require('crypto');
+const crypto  = require('crypto');
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { google } = require('googleapis');
 
 const app = express();
 
-const DROPP_API_KEY = process.env.DROPP_API_KEY;
-const WEBHOOK_SECRET = process.env.DROPP_WEBHOOK_SECRET;
+const DROPP_API_KEY    = process.env.DROPP_API_KEY;
+const WEBHOOK_SECRET   = process.env.DROPP_WEBHOOK_SECRET;
 const SALES_CHANNEL_ID = '1475643785307492557';
-const SHEET_ID = process.env.SHEET_ID;
+const SHEET_ID         = process.env.SHEET_ID;
 
+const CHATTERS = {
+  '1': { name: 'Daniel',  channelId: '1475713586751078410' },
+  '2': { name: 'Hélène',  channelId: '1475713792967970980' },
+  '3': { name: 'Rozen',   channelId: '1475713925227216916' },
+  '4': { name: 'Temad',   channelId: '1480372709496983621' },
+  '5': { name: 'Canal',   channelId: '1475722814320283812' }
+};
+
+// ─── GOOGLE SHEETS ────────────────────────────────────────────────────────────
 const sheetsAuth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
   scopes: ['https://www.googleapis.com/auth/spreadsheets']
 });
 
 async function findEmailInSheet(email) {
-  const sheets = google.sheets({ version: 'v4', auth: await sheetsAuth.getClient() });
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: 'Feuille 1!A:I'
-  });
-  const rows = res.data.values || [];
-  for (let i = 1; i < rows.length; i++) {
-    if (rows[i][4] === email) {
-      return { found: true, rowIndex: i + 1, currentTotal: parseFloat(rows[i][8]) || 0 };
+  try {
+    const sheets = google.sheets({ version: 'v4', auth: await sheetsAuth.getClient() });
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: 'Feuille 1!A:I'
+    });
+    const rows = res.data.values || [];
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i][4] === email) {
+        return { found: true, rowIndex: i + 1, currentTotal: parseFloat(rows[i][8]) || 0 };
+      }
     }
+    return { found: false };
+  } catch (err) {
+    console.error('❌ Erreur findEmailInSheet:', err.message);
+    return { found: false };
   }
-  return { found: false };
 }
 
 async function updateTotalInSheet(rowIndex, newTotal) {
-  const sheets = google.sheets({ version: 'v4', auth: await sheetsAuth.getClient() });
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: `Feuille 1!I${rowIndex}`,
-    valueInputOption: 'RAW',
-    requestBody: { values: [[newTotal]] }
-  });
+  try {
+    const sheets = google.sheets({ version: 'v4', auth: await sheetsAuth.getClient() });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `Feuille 1!I${rowIndex}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[newTotal]] }
+    });
+  } catch (err) {
+    console.error('❌ Erreur updateTotalInSheet:', err.message);
+  }
 }
 
+// ─── DISCORD ──────────────────────────────────────────────────────────────────
 const discordClient = new Client({ intents: [GatewayIntentBits.Guilds] });
 let discordReady = false;
+
 discordClient.once('ready', () => {
   console.log('✅ Discord bot prêt');
   discordReady = true;
 });
 discordClient.login(process.env.DISCORD_BOT_TOKEN);
 
-app.use(express.raw({ type: 'application/json' }));
+async function waitForDiscord() {
+  if (discordReady) return;
+  await Promise.race([
+    new Promise(resolve => discordClient.once('ready', resolve)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Discord timeout')), 10000))
+  ]);
+}
 
+// ─── VERIFY SIGNATURE ─────────────────────────────────────────────────────────
 function verifySignature(rawBody, headers) {
   const timestamp = headers['x-dropp-timestamp'];
   const signature = headers['x-dropp-signature'];
-  if (!timestamp || !signature) return false;
-  if (Math.floor(Date.now() / 1000) - parseInt(timestamp) > 300) return false;
+
+  if (!timestamp || !signature) {
+    console.log('❌ Signature: headers manquants', { timestamp: !!timestamp, signature: !!signature });
+    return false;
+  }
+
+  const age = Math.floor(Date.now() / 1000) - parseInt(timestamp);
+  if (age > 300) {
+    console.log(`❌ Signature: timestamp trop vieux (${age}s)`);
+    return false;
+  }
+
   const expected = 'sha256=' + crypto
     .createHmac('sha256', WEBHOOK_SECRET)
     .update(`${timestamp}.${rawBody}`)
     .digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+
+  try {
+    const valid = crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+    if (!valid) console.log('❌ Signature: hash incorrect');
+    return valid;
+  } catch (err) {
+    console.log('❌ Signature: erreur comparaison', err.message);
+    return false;
+  }
 }
 
+// ─── ORDER DETAILS ────────────────────────────────────────────────────────────
 async function getOrderDetails(orderId) {
-  const res = await fetch(`https://api.external.dropp.fans/v1/orders/${orderId}`, {
-    headers: { 'Authorization': `Bearer ${DROPP_API_KEY}` }
-  });
-  return await res.json();
+  try {
+    const res = await fetch(`https://api.external.dropp.fans/v1/orders/${orderId}`, {
+      headers: { 'Authorization': `Bearer ${DROPP_API_KEY}` }
+    });
+    return await res.json();
+  } catch (err) {
+    console.error('❌ Erreur getOrderDetails:', err.message);
+    return null;
+  }
 }
 
-async function waitForDiscord() {
-  if (discordReady) return;
-  await new Promise(resolve => discordClient.once('ready', resolve));
+// ─── BUILD BUTTONS ────────────────────────────────────────────────────────────
+function buildClaimRows(msgId, withLinkButton = false) {
+  const keys = Object.keys(CHATTERS);
+  const rows = [];
+
+  for (let i = 0; i < keys.length; i += 4) {
+    const row = new ActionRowBuilder();
+    keys.slice(i, i + 4).forEach(key => {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`claim_${key}_${msgId}`)
+          .setLabel(CHATTERS[key].name)
+          .setStyle(ButtonStyle.Primary)
+      );
+    });
+    rows.push(row);
+  }
+
+  if (withLinkButton) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`link_telegram_${msgId}`)
+          .setLabel('🔗 Lier le Telegram')
+          .setStyle(ButtonStyle.Secondary)
+      )
+    );
+  }
+
+  return rows;
 }
+
+// ─── WEBHOOK ──────────────────────────────────────────────────────────────────
+app.use(express.raw({ type: 'application/json' }));
 
 app.post('/webhook', async (req, res) => {
   const rawBody = req.body;
@@ -85,89 +166,58 @@ app.post('/webhook', async (req, res) => {
   console.log(`📩 Event reçu: ${payload.event}`);
 
   if (payload.event === 'order.paid') {
-    await waitForDiscord();
+    // Répond immédiatement à Dropp → évite les retries et le délai
+    res.status(200).send('OK');
 
-    const orderId = payload.data.id;
-    const montantCents = payload.data.amount.total_cents;
-    const montant = (montantCents / 100).toFixed(2);
-    const linkName = payload.data.link?.name || 'inconnu';
+    try {
+      await waitForDiscord();
 
-    const order = await getOrderDetails(orderId);
-    const email = order?.data?.buyer?.email || 'inconnu';
-    const clientName = order?.data?.buyer?.name || 'N/A';
+      const orderId      = payload.data.id;
+      const montantCents = payload.data.amount.total_cents;
+      const montant      = (montantCents / 100).toFixed(2);
+      const linkName     = payload.data.link?.name || 'inconnu';
 
-    console.log(`💰 Vente: ${montant}€ | ${email}`);
+      console.log(`💰 Vente reçue: ${montant}€ | order: ${orderId}`);
 
-    // Cherche l'email dans Sheets
-    const sheetResult = await findEmailInSheet(email);
+      const [order, channel] = await Promise.all([
+        getOrderDetails(orderId),
+        discordClient.channels.fetch(SALES_CHANNEL_ID)
+      ]);
 
-    const channel = await discordClient.channels.fetch(SALES_CHANNEL_ID);
+      const email      = order?.data?.buyer?.email || 'inconnu';
+      const clientName = order?.data?.buyer?.name  || 'N/A';
 
-    if (sheetResult.found) {
-      // Email déjà connu → update le total
-      const newTotal = sheetResult.currentTotal + parseFloat(montant);
-      await updateTotalInSheet(sheetResult.rowIndex, newTotal);
-      console.log(`🔄 Spender connu, total mis à jour: ${newTotal}€`);
+      console.log(`📧 Email: ${email} | Client: ${clientName}`);
 
-      // Notif Discord sans bouton lier telegram
-      const CHATTERS = {
-        '1': 'Daniel', '2': 'Hélène', '3': 'Rozen', '4': 'Temad', '5': 'Canal'
-      };
-      const keys = Object.keys(CHATTERS);
-      const msg = await channel.send({
-        content: `@everyone **New payment received** 🤑 *(spender connu)*\n**Montant :** ${montant} EUR\n**Client :** ${clientName}\n**Email :** ${email}\n**Produit :** ${linkName}\n**Total dépensé :** ${newTotal.toFixed(2)} EUR`
-      });
+      const sheetResult = await findEmailInSheet(email);
 
-      const realRows = [];
-      for (let i = 0; i < keys.length; i += 4) {
-        const row = new ActionRowBuilder();
-        keys.slice(i, i + 4).forEach(key => {
-          row.addComponents(
-            new ButtonBuilder()
-              .setCustomId(`claim_${key}_${msg.id}`)
-              .setLabel(CHATTERS[key])
-              .setStyle(ButtonStyle.Primary)
-          );
+      if (sheetResult.found) {
+        const newTotal = sheetResult.currentTotal + parseFloat(montant);
+
+        const [msg] = await Promise.all([
+          channel.send({
+            content: `@everyone **New payment received** 🤑 *(spender connu)*\n**Montant :** ${montant} EUR\n**Client :** ${clientName}\n**Email :** ${email}\n**Produit :** ${linkName}\n**Total dépensé :** ${newTotal.toFixed(2)} EUR`
+          }),
+          updateTotalInSheet(sheetResult.rowIndex, newTotal)
+        ]);
+
+        await msg.edit({ components: buildClaimRows(msg.id, false) });
+        console.log(`✅ Notif envoyée (spender connu) | total: ${newTotal}€`);
+
+      } else {
+        const msg = await channel.send({
+          content: `@everyone **New payment received** 🤑\n**Montant :** ${montant} EUR\n**Client :** ${clientName}\n**Email :** ${email}\n**Produit :** ${linkName}`
         });
-        realRows.push(row);
-      }
-      await msg.edit({ components: realRows });
 
-    } else {
-      // Nouveau spender → notif avec bouton lier telegram
-      const CHATTERS = {
-        '1': 'Daniel', '2': 'Hélène', '3': 'Rozen', '4': 'Temad', '5': 'Canal'
-      };
-      const keys = Object.keys(CHATTERS);
-
-      const msg = await channel.send({
-        content: `@everyone **New payment received** 🤑\n**Montant :** ${montant} EUR\n**Client :** ${clientName}\n**Email :** ${email}\n**Produit :** ${linkName}`
-      });
-
-      const realRows = [];
-      for (let i = 0; i < keys.length; i += 4) {
-        const row = new ActionRowBuilder();
-        keys.slice(i, i + 4).forEach(key => {
-          row.addComponents(
-            new ButtonBuilder()
-              .setCustomId(`claim_${key}_${msg.id}`)
-              .setLabel(CHATTERS[key])
-              .setStyle(ButtonStyle.Primary)
-          );
-        });
-        realRows.push(row);
+        await msg.edit({ components: buildClaimRows(msg.id, true) });
+        console.log(`✅ Notif envoyée (nouveau spender)`);
       }
 
-      const realLinkRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`link_telegram_${msg.id}`)
-          .setLabel('🔗 Lier le Telegram')
-          .setStyle(ButtonStyle.Secondary)
-      );
-      realRows.push(realLinkRow);
-
-      await msg.edit({ components: realRows });
+    } catch (err) {
+      console.error('❌ Erreur traitement webhook:', err.message || err);
     }
+
+    return;
   }
 
   res.status(200).send('OK');
